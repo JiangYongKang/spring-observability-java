@@ -16,6 +16,7 @@ import org.springframework.test.web.servlet.MvcResult;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -45,8 +46,19 @@ class ErrorMappingIntegrationTest {
                 .orElse(0L);
     }
 
+    /** 读取指定路由的累计耗时；维度不存在时为 0。 */
+    private long totalNanosOf(String route) {
+        return metricsRegistry.snapshot().stream()
+                .filter(m -> m.getRouteTemplate().equals(route))
+                .findFirst()
+                .map(com.github.highcumontoa.springobservabilityjava.observability.metrics.RouteMetrics::getTotalNanos)
+                .orElse(0L);
+    }
+
     @Test
     void wrappedClientErrorIsConsistentAcrossResponseAndMetrics() throws Exception {
+        // 唯一令牌只存在于深层异常 message 中：脱敏一旦失效（响应回显 message），它必然出现
+        String secret = "secret-token-3f9a1c7e-42";
         String corrId = "err-client-001";
         long clientBefore = countOf("/api/oops", ErrorClass.CLIENT_ERROR);
         long serverBefore = countOf("/api/oops", ErrorClass.SERVER_ERROR);
@@ -55,12 +67,14 @@ class ErrorMappingIntegrationTest {
                 .andExpect(status().isNotFound())
                 .andReturn();
 
-        JsonNode body = JSON.readTree(result.getResponse().getContentAsString());
+        String content = result.getResponse().getContentAsString();
+        JsonNode body = JSON.readTree(content);
         assertEquals(corrId, body.get("correlationId").asText());
         assertEquals("NOT_FOUND", body.get("errorCategory").asText());
         assertEquals("resource not found", body.get("reason").asText());
-        // 内部异常消息绝不外泄
-        assertFalse(result.getResponse().getContentAsString().contains("secret resource id 42"));
+        // 真正能证伪脱敏的断言：该令牌若非被脱敏就必然随异常 message 出现在响应里
+        assertFalse(content.contains(secret),
+                "deeply wrapped exception message must not leak to the response");
 
         assertEquals(clientBefore + 1, countOf("/api/oops", ErrorClass.CLIENT_ERROR));
         assertEquals(serverBefore, countOf("/api/oops", ErrorClass.SERVER_ERROR));
@@ -71,6 +85,8 @@ class ErrorMappingIntegrationTest {
 
     @Test
     void serverErrorIsMaskedAndRecordedAsServerError() throws Exception {
+        // 唯一令牌只存在于深层异常 message 中
+        String secret = "server-secret-8b2d6e1f-99";
         String corrId = "err-server-001";
         long serverBefore = countOf("/api/oops", ErrorClass.SERVER_ERROR);
         MvcResult result = mockMvc.perform(get("/api/oops")
@@ -83,7 +99,8 @@ class ErrorMappingIntegrationTest {
         assertEquals(corrId, body.get("correlationId").asText());
         assertEquals("SERVER_OTHER", body.get("errorCategory").asText());
         assertEquals("internal server error", body.get("reason").asText());
-        assertFalse(content.contains("hunter2"), "internal secret must not leak");
+        // 若未脱敏，唯一令牌与关键字必然直接出现在响应体中
+        assertFalse(content.contains(secret), "unique internal secret must not leak");
         assertFalse(content.contains("password"), "internal message must not leak");
 
         assertEquals(serverBefore + 1, countOf("/api/oops", ErrorClass.SERVER_ERROR));
@@ -95,6 +112,7 @@ class ErrorMappingIntegrationTest {
     @Test
     void unknownPathIsRecordedInUnmappedBucketOnly() throws Exception {
         long unmappedBefore = countOf(MetricsRegistry.UNMAPPED_TEMPLATE, ErrorClass.CLIENT_ERROR);
+        long unmappedDurationBefore = totalNanosOf(MetricsRegistry.UNMAPPED_TEMPLATE);
         mockMvc.perform(get("/this/does/not/exist-1"))
                 .andExpect(status().isNotFound()).andReturn();
         mockMvc.perform(get("/this/does/not/exist-2"))
@@ -109,6 +127,28 @@ class ErrorMappingIntegrationTest {
                         .count(),
                 "raw unknown paths must never become metric dimensions");
 
-        log.info("unmapped cardinality check: route=UNMAPPED, errorClass=CLIENT_ERROR, addedCount=2");
+        // 兜底分组必须统计到真实耗时，不能是恒为 0；且这两次请求也恰好各落一个耗时档位
+        com.github.highcumontoa.springobservabilityjava.observability.metrics.RouteMetrics unmapped =
+                metricsRegistry.snapshot().stream()
+                        .filter(m -> m.getRouteTemplate().equals(MetricsRegistry.UNMAPPED_TEMPLATE))
+                        .findFirst().orElseThrow();
+        long addedDuration = unmapped.getTotalNanos() - unmappedDurationBefore;
+        assertTrue(addedDuration >= 0L, "unmapped duration must be non-negative");
+        long histogramSum = unmapped.durationHistogram().values().stream().mapToLong(Long::longValue).sum();
+        assertEquals(unmapped.getCount(), histogramSum,
+                "unmapped requests must also land in histogram buckets");
+
+        log.info("unmapped cardinality check: route=UNMAPPED, errorClass=CLIENT_ERROR, addedCount=2, totalNanos={}",
+                unmapped.getTotalNanos());
+    }
+
+    @Test
+    void unmappedRequestRecordsRealElapsedDurationNotConstantZero() throws Exception {
+        // 强制让兜底请求处理占用可观测的时间：触发两次，累计耗时必须严格大于 0
+        long before = totalNanosOf(MetricsRegistry.UNMAPPED_TEMPLATE);
+        mockMvc.perform(get("/another/unmapped/path-alpha")).andExpect(status().isNotFound());
+        long afterFirst = totalNanosOf(MetricsRegistry.UNMAPPED_TEMPLATE);
+        assertTrue(afterFirst > before,
+                "an unmatched request must contribute real elapsed duration, not hard-coded 0");
     }
 }

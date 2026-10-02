@@ -16,11 +16,11 @@ import org.springframework.web.servlet.HandlerMapping;
  *
  * <p>错误分类以最终对外 HTTP 状态码为准（{@link ErrorClass#fromStatus(int)}），因此无论异常
  * 是否被包装、是否被全局处理器处理，指标中的错误分类与调用方看到的状态始终一致。</p>
+ *
+ * <p>计时起点来自 {@link RequestTiming}（过滤器层盖戳，对所有请求生效），与兜底分组读取
+ * 同一处起点，保证耗时口径统一。</p>
  */
 public class RouteMetricsInterceptor implements HandlerInterceptor {
-
-    /** 请求属性中记录开始时间的键。 */
-    private static final String START_NANOS_ATTR = RouteMetricsInterceptor.class.getName() + ".startNanos";
 
     private static final Logger log = LoggerFactory.getLogger(RouteMetricsInterceptor.class);
 
@@ -32,16 +32,15 @@ public class RouteMetricsInterceptor implements HandlerInterceptor {
 
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
-        request.setAttribute(START_NANOS_ATTR, System.nanoTime());
+        // 拦截器只覆盖匹配到处理器的请求；此处补戳仅为防御，统一起点已由 RequestTimingFilter 盖好
+        RequestTiming.stamp(request);
         return true;
     }
 
     @Override
     public void afterCompletion(HttpServletRequest request, HttpServletResponse response,
                                 Object handler, Exception ex) {
-        Object startAttr = request.getAttribute(START_NANOS_ATTR);
-        long startNanos = startAttr instanceof Long value ? value : System.nanoTime();
-        long durationNanos = Math.max(0L, System.nanoTime() - startNanos);
+        long durationNanos = RequestTiming.elapsedNanos(request);
 
         String template = resolveRouteTemplate(request);
         ErrorClass errorClass = ErrorClass.fromStatus(response.getStatus());

@@ -3,12 +3,16 @@ package com.github.highcumontoa.springobservabilityjava.observability.error;
 import com.github.highcumontoa.springobservabilityjava.observability.correlation.CorrelationContext;
 import com.github.highcumontoa.springobservabilityjava.observability.metrics.ErrorClass;
 import com.github.highcumontoa.springobservabilityjava.observability.metrics.MetricsRegistry;
+import com.github.highcumontoa.springobservabilityjava.observability.metrics.RequestTiming;
+import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.HandlerMapping;
 import org.springframework.web.servlet.NoHandlerFoundException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
  * 全局异常处理：分类结果（{@link ExceptionClassifier}）同时用于结构化日志与对外响应。
@@ -32,21 +36,30 @@ public class GlobalExceptionHandler {
     /**
      * 未匹配处理器的请求不会进入 HandlerInterceptor 链，因此在此显式计入固定 UNMAPPED 桶，
      * 保证"无法归属路由的请求"既不被遗漏，也不会按原始 URI 新建维度。
+     * 耗时取自过滤器层盖的计时戳（{@link RequestTiming}），是真实处理耗时而非恒为 0。
      */
-    @ExceptionHandler(NoHandlerFoundException.class)
-    public ResponseEntity<ApiError> handleNoHandler(NoHandlerFoundException ex) {
+    @ExceptionHandler({NoHandlerFoundException.class, NoResourceFoundException.class})
+    public ResponseEntity<ApiError> handleNoHandler(HttpServletRequest request, Exception ex) {
         ExceptionClassifier.Classification result = classifier.classify(ex);
-        metricsRegistry.record(MetricsRegistry.UNMAPPED_TEMPLATE, 0L, result.errorClass());
-        log.warn("request failed: route={}, errorCategory={}, httpStatus={}",
-                MetricsRegistry.UNMAPPED_TEMPLATE, result.category(), result.httpStatus());
+        long durationNanos = RequestTiming.elapsedNanos(request);
+        metricsRegistry.record(MetricsRegistry.UNMAPPED_TEMPLATE, durationNanos, result.errorClass());
+        log.warn("request failed: route={}, errorCategory={}, httpStatus={}, durationNanos={}",
+                MetricsRegistry.UNMAPPED_TEMPLATE, result.category(), result.httpStatus(), durationNanos);
         return ResponseEntity.status(result.httpStatus())
                 .body(new ApiError(CorrelationContext.currentId(), result.category().name(),
                         result.publicReason()));
     }
 
     @ExceptionHandler(Exception.class)
-    public ResponseEntity<ApiError> handleAny(Exception ex) {
+    public ResponseEntity<ApiError> handleAny(HttpServletRequest request, Exception ex) {
         ExceptionClassifier.Classification result = classifier.classify(ex);
+
+        // 没有匹配到路由模板的请求，拦截器不会执行；此处兜底记入 UNMAPPED，防止任何路径漏记。
+        // 已匹配路由的请求由拦截器在 afterCompletion 统一记录，此处不重复计数。
+        if (request.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE) == null) {
+            metricsRegistry.record(MetricsRegistry.UNMAPPED_TEMPLATE,
+                    RequestTiming.elapsedNanos(request), result.errorClass());
+        }
 
         // 日志携带关联标识（MDC）与细分类别；服务端错误保留完整堆栈用于排障
         if (result.errorClass() == ErrorClass.SERVER_ERROR) {

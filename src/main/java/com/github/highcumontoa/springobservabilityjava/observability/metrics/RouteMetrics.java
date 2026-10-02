@@ -19,6 +19,8 @@ public final class RouteMetrics {
     private final LongAdder totalDurationNanos = new LongAdder();
     private final AtomicLong maxDurationNanos = new AtomicLong();
     private final Map<ErrorClass, LongAdder> countsByErrorClass = new EnumMap<>(ErrorClass.class);
+    private final Map<DurationBucket, LongAdder> countsByDurationBucket =
+            new EnumMap<>(DurationBucket.class);
 
     public RouteMetrics(String routeTemplate) {
         if (routeTemplate == null || routeTemplate.isBlank()) {
@@ -28,9 +30,16 @@ public final class RouteMetrics {
         for (ErrorClass errorClass : ErrorClass.values()) {
             countsByErrorClass.put(errorClass, new LongAdder());
         }
+        // 固定档位数组，内存占用与路由数 × 档位数成正比（均为编译期常量），与请求量无关
+        for (DurationBucket bucket : DurationBucket.values()) {
+            countsByDurationBucket.put(bucket, new LongAdder());
+        }
     }
 
-    /** 记录一次请求：增加总计数与该错误分类计数，累加耗时并更新最大值。 */
+    /**
+     * 记录一次请求：增加总计数与该错误分类计数，累加耗时、更新最大值，
+     * 并把这次请求<strong>恰好</strong>计入一个耗时档位。
+     */
     public void record(long durationNanos, ErrorClass errorClass) {
         if (durationNanos < 0) {
             throw new IllegalArgumentException("durationNanos must be non-negative");
@@ -41,6 +50,7 @@ public final class RouteMetrics {
         totalCount.increment();
         totalDurationNanos.add(durationNanos);
         countsByErrorClass.get(errorClass).increment();
+        countsByDurationBucket.get(DurationBucket.forNanos(durationNanos)).increment();
         maxDurationNanos.accumulateAndGet(durationNanos, Math::max);
     }
 
@@ -62,5 +72,19 @@ public final class RouteMetrics {
 
     public long getMaxNanos() {
         return maxDurationNanos.get();
+    }
+
+    /** 指定耗时档位的计数。 */
+    public long getCount(DurationBucket bucket) {
+        return countsByDurationBucket.get(bucket).sum();
+    }
+
+    /** 导出固定顺序（按上界从小到大）的耗时分布视图。 */
+    public Map<DurationBucket, Long> durationHistogram() {
+        Map<DurationBucket, Long> histogram = new EnumMap<>(DurationBucket.class);
+        for (DurationBucket bucket : DurationBucket.values()) {
+            histogram.put(bucket, countsByDurationBucket.get(bucket).sum());
+        }
+        return histogram;
     }
 }

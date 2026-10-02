@@ -49,10 +49,12 @@ public class DemoController {
     @GetMapping("/oops")
     public Map<String, Object> oops(@RequestParam(name = "kind", defaultValue = "server") String kind) {
         if ("client".equals(kind)) {
-            // 深层包装的客户端错误：cause 链第 3 层才是可识别异常
+            // 深层包装的客户端错误：cause 链第 3 层才是可识别异常。
+            // 消息中携带唯一敏感令牌，仅应出现在服务端日志；若响应回显异常 message 就会泄漏它
             throw new RuntimeException("outer wrapper",
                     new IllegalStateException("middle wrapper",
-                            new ResponseStatusException(HttpStatus.NOT_FOUND, "missing resource 42")));
+                            new ResponseStatusException(HttpStatus.NOT_FOUND,
+                                    "missing resource secret-token-3f9a1c7e-42")));
         }
         if ("conflict".equals(kind)) {
             throw new ResponseStatusException(HttpStatus.CONFLICT, "state conflict");
@@ -60,13 +62,18 @@ public class DemoController {
         // 默认：深层包装的服务端错误，内部细节不得出现在响应体中
         throw new RuntimeException("outer",
                 new IllegalStateException("middle",
-                        new IllegalStateException("db password=hunter2 connection failed")));
+                        new IllegalStateException(
+                                "db password=hunter2 token=server-secret-8b2d6e1f-99 connection failed")));
     }
 
     @PostMapping("/items/{itemId}/checkout")
-    public Map<String, Object> checkout(@PathVariable String itemId, @RequestBody(required = false) String body) {
-        log.info("checkout requested: itemId={}", itemId);
-        CompletableFuture<String> future = asyncWorkService.processCheckout(itemId);
+    public Map<String, Object> checkout(@PathVariable String itemId,
+                                        @RequestBody(required = false) String body,
+                                        @RequestParam(name = "asyncFail", required = false) String asyncFail) {
+        log.info("checkout requested: itemId={}, asyncFail={}", itemId, asyncFail);
+        // 等到异步结果：异步任务失败时 join 抛出 CompletionException，由全局异常处理器解包归因，
+        // 因此日志/指标/响应状态三处对这次异步失败使用同一分类，且不会被算成成功
+        CompletableFuture<String> future = asyncWorkService.processCheckout(itemId, asyncFail);
         return Map.of("itemId", itemId, "accepted", true, "asyncJob", future.join());
     }
 }

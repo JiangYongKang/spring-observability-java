@@ -24,9 +24,12 @@ class ExceptionClassificationTest {
 
     @Test
     void deeplyWrappedClientErrorIsUnwrappedTo404() {
+        // 唯一令牌只存在于最深层异常 message：若把 message 当作对外文案，它必现，断言即可证伪脱敏
+        String secret = "unit-secret-5c2e8a11-404";
         Exception wrapped = new RuntimeException("outer",
                 new IllegalStateException("middle",
-                        new ResponseStatusException(HttpStatus.NOT_FOUND, "secret resource id 42")));
+                        new ResponseStatusException(HttpStatus.NOT_FOUND,
+                                "secret resource " + secret + " id 42")));
         ExceptionClassifier.Classification result = classifier.classify(wrapped);
 
         // 在模拟请求上下文中打印：关联标识 + 错误分类（满足测试日志可解释性）
@@ -39,6 +42,8 @@ class ExceptionClassificationTest {
         assertEquals(ErrorCategory.NOT_FOUND, result.category());
         assertEquals(ErrorClass.CLIENT_ERROR, result.errorClass());
         assertEquals(404, result.httpStatus());
+        assertFalse(result.publicReason().contains(secret),
+                "public reason must be a fixed masked message, never the internal exception text");
     }
 
     @Test

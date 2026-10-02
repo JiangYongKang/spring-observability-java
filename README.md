@@ -1,8 +1,9 @@
-# Spring Boot 请求全链路可观测能力（关联标识 / 路由指标 / 异常归因）
+# Spring Boot 请求全链路可观测能力（关联标识 / 路由指标 / 耗时分布 / 异常归因 / 统计重置）
 
 在 Spring Boot 3.4（Java 21）骨架上实现的一套进程内可观测能力，**不依赖任何外部服务或凭据**：
 每个入站请求都有唯一关联标识并透传到异步线程；指标按路由模板聚合且基数有界；
-异常（含多层包装）被归一为稳定的错误类别，并在日志、指标、HTTP 响应三处保持一致。
+每条路由额外提供固定档位的耗时分布；异常（含多层包装、含异步任务失败）被归一为稳定的错误类别，
+并在日志、指标、HTTP 响应三处保持一致；统计可随时原子重置为一个全新批次，便于隔离压测/回归的这一批请求。
 
 ## 1. 关联标识的生成与透传规则
 
@@ -26,25 +27,73 @@
   - `observability/correlation/CorrelationTaskDecorator.java`
   - `observability/config/AsyncConfig.java`
 
-## 2. 指标维度与基数约束
+## 2. 指标维度、耗时分布与基数约束
 
-- 端点：`GET /internal/metrics`（进程内快照，JSON）。
+- 端点：`GET /internal/metrics`（进程内快照，JSON，含当前批次号 `generation`）。
 - **维度只有两个**：路由模板（如 `/api/items/{itemId}`）与错误分类（`NONE/CLIENT_ERROR/SERVER_ERROR`）。
   路径参数值（`/items/1`、`/items/2`）永远不会成为维度值，不同参数归入同一模板。
 - **基数上界明确**：维度数 = 应用注册的路由模板数（编译期可见、有界）+ 一个固定桶，
   不随 URL/参数/用户输入增长。
 - **无法归属路由的请求**（未匹配处理器、404）统一计入固定桶 `UNMAPPED`，
   既不丢失计数，也**绝不按原始 URI 新建维度**（该类请求不经过拦截器，由全局异常处理器补记）。
-- **统计内容**：总请求数、按错误分类计数、总耗时、最大耗时（纳秒）。
+- **统计内容**：总请求数、按错误分类计数、总耗时、最大耗时（纳秒）、以及下面的**耗时分布**。
 - **并发正确性**：计数使用 `LongAdder`（分段累加），最大耗时用 `AtomicLong` CAS 更新；
-  注册表用 `ConcurrentHashMap#computeIfAbsent` 原子建桶。并发写入不丢失、不重复
-  （单元测试以 16 线程 × 2000 次 = 32000 次写入校验总数与分类分项之和完全相等）。
-- **取舍说明**：指标只在内存中保存、进程重启归零，目的是本地可复现验证；
-  未引入百分位/直方图等需要额外内存结构的统计，避免无界内存增长。
+  注册表用 `ConcurrentHashMap#computeIfAbsent` 原子建桶。并发写入不丢失、不重复。
+
+### 2.1 耗时分布（固定档位直方图）
+
+每条路由额外维护一个**固定 8 档**的耗时直方图，用于定位慢请求占比。档位在编译期写死，
+左开右闭（首档含 0），边界精确到纳秒：
+
+| 档位 | 区间（d = 请求耗时） |
+|---|---|
+| `<=1ms` | `0 ≤ d ≤ 1ms` |
+| `1ms-5ms` | `1ms < d ≤ 5ms` |
+| `5ms-10ms` | `5ms < d ≤ 10ms` |
+| `10ms-25ms` | `10ms < d ≤ 25ms` |
+| `25ms-50ms` | `25ms < d ≤ 50ms` |
+| `50ms-100ms` | `50ms < d ≤ 100ms` |
+| `100ms-500ms` | `100ms < d ≤ 500ms` |
+| `>500ms` | `d > 500ms` |
+
+- **恰好落一档**：`DurationBucket.forNanos` 对任意非负耗时返回唯一档位（首个满足 `d ≤ 上界` 的档），
+  因此并发下每个请求不多不少正好计入一个档位，**各档计数之和恒等于该路由总请求数**；
+  分档计数与总计数、总耗时、最大值在同一次 `record` 内一起更新，彼此自洽。
+- **内存 / 基数约束**：每条路由的内存开销 = 固定 8 个 `LongAdder`，与请求量、URL 数量无关；
+  路由数本身仍有上界。不使用随观测值增长的分位数结构或样本蓄水池。
+- **同一路由不被参数拆开**：档位计数挂在路由模板的 `RouteMetrics` 上，
+  `/items/1` 与 `/items/2` 的分布合并在 `/api/items/{itemId}` 同一组档位里。
+- **兜底请求也有真实耗时**：计时起点由最先执行的 `RequestTimingFilter`（过滤器层，先于路由匹配）
+  盖在请求属性上，拦截器与全局异常处理器读同一处起点。因此未匹配路由、进入 `UNMAPPED`
+  固定桶的请求同样统计真实耗时与档位，**不再出现耗时恒为 0 的情况**。
 - 代码入口：
+  - `observability/metrics/DurationBucket.java`
+  - `observability/metrics/RequestTiming.java` / `RequestTimingFilter.java`
   - `observability/metrics/MetricsRegistry.java`
   - `observability/metrics/RouteMetrics.java`
   - `observability/metrics/RouteMetricsInterceptor.java`
+
+### 2.2 统计重置（批次隔离，压测/回归用）
+
+- 端点：`POST /internal/metrics/reset`。把统计起点**原子地**重置到当前时刻：
+  返回被冻结的上一批次快照（`generation / startedAt / resetAt / 各路由最终值`），
+  随后的请求在序号 +1 的全新批次里从零累计；`GET /internal/metrics` 的 `generation`
+  可用来确认"这一批"。
+- **语义**：以"记录完成时刻"为边界——重置前完成的请求全部留在旧批次（出现在冻结快照里），
+  重置期间或之后完成的请求全部进入新批次。历史批次冻结后不再变化，新旧批次互不污染。
+- **并发边界（不丢、不重、不混批）**：注册表内部以"代（generation）"保存计数器，
+  重置 = 整体替换当前代；并用一把 `ReentrantReadWriteLock` 协调——
+  每次 `record` 持共享读锁（记录之间仍完全并发），`reset` 持独占写锁。
+  这保证一次记录**整体**地发生在重置之前或之后，不存在"重置前读到旧计数器、重置后才写入"
+  的跨边界半截记录，因此：不丢计数、不重复计数、重置前后的请求不会混入同一批。
+- 代码入口：
+  - `observability/metrics/Generation.java`
+  - `observability/metrics/RegistrySnapshot.java` / `RouteSnapshot.java`
+  - `observability/metrics/MetricsRegistry.java`（`reset()`）
+  - `observability/web/MetricsController.java`
+
+- **取舍说明**：指标只在内存中保存、进程重启归零，目的是本地可复现验证；
+  耗时分档为固定档位而非精确百分位，以严格保证内存有界。
 
 ## 3. 错误分类规则
 
@@ -71,6 +120,25 @@
   - `observability/error/GlobalExceptionHandler.java`
   - `observability/error/ApiError.java`
 
+### 3.1 异步失败的归因规则
+
+请求触发的 `@Async` 任务一旦失败，**失败与成功明确区分，且日志、指标、响应状态三处同分类**：
+
+1. 工作线程上的 `AsyncWorkService` 捕获到失败时，先在**工作线程**打一条 ERROR 日志
+   （携带还原后的同一 `correlationId`、完整堆栈），再把异常通过 `CompletableFuture` 抛出；
+2. 请求线程在 `future.join()` 处收到 `CompletionException`，交给 `GlobalExceptionHandler`；
+   `ExceptionClassifier` 沿 `getCause()` 链解包（`CompletionException` 只是包装层），
+   链上第一个可识别异常决定最终类别——异步深层包装的 404 仍归 `NOT_FOUND/CLIENT_ERROR/404`，
+   内部失败归 `SERVER_OTHER/SERVER_ERROR/500`；
+3. 因而：
+   - **响应**：等待结果的请求直接收到该状态码与脱敏文案，响应头/体仍带同一关联标识；
+   - **日志**：工作线程一条 ERROR（同 `corrId`、含堆栈）+ 处理器侧一条失败日志；
+   - **指标**：该请求按最终状态计入 `CLIENT_ERROR`/`SERVER_ERROR`，**不会被算成成功**，
+     同时按真实耗时落入一个耗时档位。
+   - 内部异常 message（含密码、令牌）只进服务端日志，绝不回显给调用方。
+- 代码入口：`observability/web/AsyncWorkService.java`、`observability/web/DemoController.java`
+  （checkout 的 `asyncFail=client|server`）、复用第 3 节的 `ExceptionClassifier`/`GlobalExceptionHandler`。
+
 ## 4. 日志
 
 日志格式（`logback-spring.xml`，测试使用 `src/test/resources/logback-test.xml`）固定携带：
@@ -81,19 +149,23 @@
 
 - 请求开始/结束、控制器、`@Async` 工作线程日志均带同一 `corrId`；
 - 指标拦截器每个请求打印一行 `request observed: route=<模板>, status=, errorClass=, durationNanos=`，
-  即"关联标识 + 路由模板 + 错误分类"同时出现在日志行中。
+  即"关联标识 + 路由模板 + 错误分类"同时出现在日志行中；
+- 异步任务失败时，`obs-async-*` 工作线程会打 `async job failed` ERROR 行，携带同一 `corrId`。
 
 ## 5. 演示端点
 
 | 方法/路径 | 说明 |
 |---|---|
 | `GET /api/items/{itemId}` | 正常请求；加 `?fail=1` 触发 400 |
-| `GET /api/oops?kind=client` | 三层包装的 404（验证解包归因） |
+| `GET /api/oops?kind=client` | 三层包装的 404（验证解包归因；含唯一敏感令牌验证脱敏） |
 | `GET /api/oops?kind=conflict` | 409 |
 | `GET /api/oops`（默认） | 三层包装的 500（含伪造敏感串，验证脱敏） |
 | `POST /api/items/{itemId}/checkout` | 触发 `@Async`，验证异步标识透传 |
-| `GET /internal/metrics` | 指标快照 |
-| 任意未注册路径 | 404 且计入 `UNMAPPED` 桶 |
+| `POST /api/items/{itemId}/checkout?asyncFail=client` | 异步任务深层包装 404（验证异步失败归因、失败不计成功） |
+| `POST /api/items/{itemId}/checkout?asyncFail=server` | 异步任务内部失败 500（验证脱敏 + 工作线程 ERROR 日志） |
+| `GET /internal/metrics` | 当前批次指标快照（含 `generation` 与 `durationHistogram`） |
+| `POST /internal/metrics/reset` | 原子重置统计起点，返回冻结的上一批次 |
+| 任意未注册路径 | 404 且计入 `UNMAPPED` 桶（含真实耗时） |
 
 ## 6. 本地验证方法
 
@@ -105,15 +177,20 @@
 mvn test
 ```
 
-测试覆盖（共 16 个用例）：
+测试覆盖（共 28 个用例）：
 
 | 测试类 | 覆盖点 |
 |---|---|
-| `ExceptionClassificationTest` | 深层包装解包、404/409/400 细类可区分、500 脱敏、cause 成环不死循环 |
+| `ExceptionClassificationTest` | 深层包装解包、404/409/400 细类可区分、500 脱敏、cause 成环不死循环；唯一令牌证伪脱敏 |
 | `RouteMetricsConcurrencyTest` | 16 线程并发写 32000 次计数精确相等；UNMAPPED 不产生新维度 |
+| `DurationHistogramTest` | 固定 8 档边界唯一归属；各档之和 = 总数；并发下每请求恰好一档；总耗时/最大值自洽 |
 | `CorrelationIdFilterTest` | 入站标识原样沿用、缺失生成、畸形替换；INBOUND/GENERATED 可区分 |
 | `AsyncCorrelationTest` | 24 客户端 × 20 次真实 HTTP 并发（核心线程仅 2，强制线程复用），异步线程标识零串号，指标总数=请求总数 |
-| `ErrorMappingIntegrationTest` | 嵌套异常在响应/指标一致、500 敏感信息不外泄、未知路径只进 UNMAPPED |
+| `AsyncFailureAttributionTest` | 异步 client/server 失败归因一致、失败不计成功、成功仍计成功、同关联标识、内部细节不外泄 |
+| `AsyncFailureLoggingTest` | 异步失败在 `obs-async-*` 工作线程打 ERROR 且携带同一关联标识 |
+| `ErrorMappingIntegrationTest` | 嵌套异常响应/指标一致、唯一令牌证明脱敏生效、未知路径只进 UNMAPPED 且有真实耗时 |
+| `MetricsResetTest` | 重置后批次独立从零累计、历史冻结不变；12 记录线程 × 3 重置线程高并发下不丢不重不混批、批次号连续 |
+| `MetricsResetEndpointTest` | 重置端点冻结上一批、当前批次归零、重置后请求只进新批 |
 
 测试日志中可见 `corrId`、路由模板与 `errorClass`/`errorCategory`。
 
@@ -130,13 +207,24 @@ curl -i http://localhost:18080/api/items/42
 # 异步透传
 curl -s -H 'X-Correlation-ID: async-trace-1' -X POST -d '{}' \
   -H 'Content-Type: application/json' http://localhost:18080/api/items/42/checkout
+# 异步失败：404（深层包装），失败计入 CLIENT_ERROR 而不是成功
+curl -i -X POST -H 'X-Correlation-ID: async-404' \
+  'http://localhost:18080/api/items/42/checkout?asyncFail=client'
+# 异步失败：500，响应体不含 password/token；工作线程日志有 async job failed + 同一 corrId
+curl -i -X POST -H 'X-Correlation-ID: async-500' \
+  'http://localhost:18080/api/items/42/checkout?asyncFail=server'
 # 嵌套客户端异常 → 404 NOT_FOUND
 curl -i 'http://localhost:18080/api/oops?kind=client'
 # 嵌套服务端异常 → 500，响应体不含内部细节
 curl -i http://localhost:18080/api/oops
-# 未知路径 → 404，计入固定 UNMAPPED 桶
+# 未知路径 → 404，计入固定 UNMAPPED 桶（带真实耗时）
 curl -i http://localhost:18080/some/random/path
-# 指标快照（注意 /items/{itemId} 聚合了不同参数值，基数有界）
+# 指标快照（generation + 每路由 durationHistogram；不同参数聚合在同一模板）
+curl http://localhost:18080/internal/metrics
+# 压测前重置：返回冻结的上一批，随后的请求进入 generation+1 的新批次
+curl -s -X POST http://localhost:18080/internal/metrics/reset
+# 再来一批请求后重新查看，确认只有重置后的计数
+curl -H 'X-Correlation-ID: bench-1' http://localhost:18080/api/items/1
 curl http://localhost:18080/internal/metrics
 ```
 
