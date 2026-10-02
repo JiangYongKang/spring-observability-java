@@ -12,6 +12,7 @@ import org.springframework.web.server.ResponseStatusException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * 异常归因单元测试：深层包装、成环 cause、客户端/服务端区分、脱敏文案。
@@ -58,17 +59,24 @@ class ExceptionClassificationTest {
 
     @Test
     void serverErrorDetailsAreNeverExposed() {
-        Exception wrapped = new RuntimeException("outer",
-                new IllegalStateException("middle",
-                        new IllegalStateException("db password=hunter2 token=abc123 failed")));
+        // 敏感串被刻意放进最深层异常的 message：若脱敏失效，它必然随原始 message 流出。
+        // 这里先断言它确实出现在"脱敏前的输入"里，保证后续 publicReason 断言不是恒真。
+        String secretToken = "hunter2";
+        String secretField = "password";
+        IllegalStateException internal =
+                new IllegalStateException("db " + secretField + "=" + secretToken + " token=abc123 failed");
+        Exception wrapped = new RuntimeException("outer", new IllegalStateException("middle", internal));
+        assertTrue(internal.getMessage().contains(secretToken),
+                "test fixture must actually contain the secret before masking");
+
         ExceptionClassifier.Classification result = classifier.classify(wrapped);
 
         assertEquals(ErrorCategory.SERVER_OTHER, result.category());
         assertEquals(ErrorClass.SERVER_ERROR, result.errorClass());
         assertEquals(500, result.httpStatus());
         assertEquals("internal server error", result.publicReason());
-        assertFalse(result.publicReason().contains("hunter2"));
-        assertFalse(result.publicReason().contains("password"));
+        assertFalse(result.publicReason().contains(secretToken));
+        assertFalse(result.publicReason().contains(secretField));
     }
 
     @Test

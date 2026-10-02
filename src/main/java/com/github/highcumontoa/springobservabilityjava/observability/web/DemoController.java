@@ -64,9 +64,14 @@ public class DemoController {
     }
 
     @PostMapping("/items/{itemId}/checkout")
-    public Map<String, Object> checkout(@PathVariable String itemId, @RequestBody(required = false) String body) {
-        log.info("checkout requested: itemId={}", itemId);
-        CompletableFuture<String> future = asyncWorkService.processCheckout(itemId);
+    public Map<String, Object> checkout(@PathVariable String itemId,
+                                        @RequestParam(name = "fail", required = false) Boolean fail,
+                                        @RequestBody(required = false) String body) {
+        boolean shouldFail = Boolean.TRUE.equals(fail);
+        log.info("checkout requested: itemId={}, fail={}", itemId, shouldFail);
+        // join() 等到异步结果：失败时异常在请求线程上抛出，由全局异常处理器按同一分类归一，
+        // 指标按最终响应状态归类，因此日志/指标/响应对这次异步失败的分类完全一致。
+        CompletableFuture<String> future = asyncWorkService.processCheckout(itemId, shouldFail);
         return Map.of("itemId", itemId, "accepted", true, "asyncJob", future.join());
     }
 }

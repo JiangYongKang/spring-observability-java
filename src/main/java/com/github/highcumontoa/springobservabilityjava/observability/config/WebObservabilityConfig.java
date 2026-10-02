@@ -1,6 +1,7 @@
 package com.github.highcumontoa.springobservabilityjava.observability.config;
 
 import com.github.highcumontoa.springobservabilityjava.observability.correlation.CorrelationIdFilter;
+import com.github.highcumontoa.springobservabilityjava.observability.metrics.MetricsObservationFilter;
 import com.github.highcumontoa.springobservabilityjava.observability.metrics.MetricsRegistry;
 import com.github.highcumontoa.springobservabilityjava.observability.metrics.RouteMetricsInterceptor;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
@@ -36,12 +37,29 @@ public class WebObservabilityConfig implements WebMvcConfigurer {
     }
 
     @Bean
+    public MetricsObservationFilter metricsObservationFilter(MetricsRegistry registry) {
+        return new MetricsObservationFilter(registry);
+    }
+
+    @Bean
+    public FilterRegistrationBean<MetricsObservationFilter> metricsFilterRegistration(
+            MetricsObservationFilter filter) {
+        FilterRegistrationBean<MetricsObservationFilter> registration =
+                new FilterRegistrationBean<>(filter);
+        // 紧随关联标识过滤器之后：计时与代次钉取覆盖全部请求，且日志行已带关联标识
+        registration.setOrder(Ordered.HIGHEST_PRECEDENCE + 10);
+        return registration;
+    }
+
+    @Bean
     public RouteMetricsInterceptor routeMetricsInterceptor(MetricsRegistry registry) {
         return new RouteMetricsInterceptor(registry);
     }
 
     @Override
     public void addInterceptors(InterceptorRegistry registry) {
-        registry.addInterceptor(routeMetricsInterceptor(metricsRegistry()));
+        registry.addInterceptor(routeMetricsInterceptor(metricsRegistry()))
+                // 指标自管理端点不参与自身观测
+                .excludePathPatterns("/internal/metrics", "/internal/metrics/**");
     }
 }

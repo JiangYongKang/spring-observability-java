@@ -14,7 +14,7 @@ import org.springframework.web.servlet.NoHandlerFoundException;
  * 全局异常处理：分类结果（{@link ExceptionClassifier}）同时用于结构化日志与对外响应。
  *
  * <p>响应体只包含关联标识、错误类别与固定脱敏文案；异常类型、消息、堆栈只写服务端日志，
- * 不向调用方泄露内部实现细节。响应状态码即指标拦截器读取的状态，三处分类天然一致。</p>
+ * 不向调用方泄露内部实现细节。响应状态码即指标观测层读取的状态，三处分类天然一致。</p>
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
@@ -22,21 +22,19 @@ public class GlobalExceptionHandler {
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
     private final ExceptionClassifier classifier;
-    private final MetricsRegistry metricsRegistry;
 
-    public GlobalExceptionHandler(ExceptionClassifier classifier, MetricsRegistry metricsRegistry) {
+    public GlobalExceptionHandler(ExceptionClassifier classifier) {
         this.classifier = classifier;
-        this.metricsRegistry = metricsRegistry;
     }
 
     /**
-     * 未匹配处理器的请求不会进入 HandlerInterceptor 链，因此在此显式计入固定 UNMAPPED 桶，
-     * 保证"无法归属路由的请求"既不被遗漏，也不会按原始 URI 新建维度。
+     * 未匹配处理器的请求不会进入 HandlerInterceptor 链；其指标（含<strong>真实耗时</strong>）
+     * 由 {@code MetricsObservationFilter} 在最外层兜底计入固定 UNMAPPED 桶。这里只负责
+     * 分类、脱敏响应与日志，保证"无法归属路由的请求"不按原始 URI 新建维度。
      */
     @ExceptionHandler(NoHandlerFoundException.class)
     public ResponseEntity<ApiError> handleNoHandler(NoHandlerFoundException ex) {
         ExceptionClassifier.Classification result = classifier.classify(ex);
-        metricsRegistry.record(MetricsRegistry.UNMAPPED_TEMPLATE, 0L, result.errorClass());
         log.warn("request failed: route={}, errorCategory={}, httpStatus={}",
                 MetricsRegistry.UNMAPPED_TEMPLATE, result.category(), result.httpStatus());
         return ResponseEntity.status(result.httpStatus())
@@ -48,13 +46,13 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiError> handleAny(Exception ex) {
         ExceptionClassifier.Classification result = classifier.classify(ex);
 
-        // 日志携带关联标识（MDC）与细分类别；服务端错误保留完整堆栈用于排障
+        // 日志携带关联标识（MDC）与细分类别；5xx 打完整堆栈，4xx 也附原始异常用于排障
         if (result.errorClass() == ErrorClass.SERVER_ERROR) {
             log.error("request failed: errorCategory={}, httpStatus={}",
                     result.category(), result.httpStatus(), ex);
         } else {
             log.warn("request failed: errorCategory={}, httpStatus={}, reason={}",
-                    result.category(), result.httpStatus(), result.publicReason());
+                    result.category(), result.httpStatus(), result.publicReason(), ex);
         }
 
         String correlationId = CorrelationContext.currentId();
