@@ -2,6 +2,7 @@ package com.github.highcumontoa.springobservabilityjava.observability.web;
 
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import com.github.highcumontoa.springobservabilityjava.observability.correlation.CorrelationContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -34,6 +35,38 @@ public class DemoController {
 
     public DemoController(AsyncWorkService asyncWorkService) {
         this.asyncWorkService = asyncWorkService;
+    }
+
+    /**
+     * 可控的慢端点（用于本地核对统计重置的在途边界，无生产用途）：
+     * 请求进入后阻塞在 {@code gate} 上直到被放开，从而可以稳定地制造"重置前进入、重置后才结束"。
+     */
+    private static volatile CountDownLatch slowGate = new CountDownLatch(0);
+    private static volatile CountDownLatch slowEntered = new CountDownLatch(0);
+
+    /** 让下一个慢请求阻塞，直到调用 {@link #releaseSlowRequest()}；并复位"已进入"信号。 */
+    public static void armSlowRequest() {
+        slowGate = new CountDownLatch(1);
+        slowEntered = new CountDownLatch(1);
+    }
+
+    /** 阻塞直到被 arm 的慢请求真正进入控制器（已完成进入时的批次领取）。 */
+    public static void awaitSlowRequestEntered() throws InterruptedException {
+        slowEntered.await(5, java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    /** 放开被 arm 的慢请求。 */
+    public static void releaseSlowRequest() {
+        slowGate.countDown();
+    }
+
+    @GetMapping("/slow")
+    public Map<String, Object> slow() throws InterruptedException {
+        log.info("slow request entered, waiting for gate");
+        slowEntered.countDown();
+        slowGate.await();
+        log.info("slow request released");
+        return Map.of("done", true, "correlationId", CorrelationContext.currentId());
     }
 
     @GetMapping("/items/{itemId}")

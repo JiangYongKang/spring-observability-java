@@ -84,4 +84,47 @@ class MetricsResetEndpointTest {
         log.info("reset endpoint check: frozenCount=2, nextGeneration={}, postResetCount=1",
                 current2.get("generation").asLong());
     }
+
+    @Test
+    void resetAndMetricsOperationsAreNeverCountedAsBusinessTraffic() throws Exception {
+        // 以一次重置建立干净基线
+        mockMvc.perform(post("/internal/metrics/reset")).andExpect(status().isOk());
+        long genAfterBaseline = metricsRegistry.currentGenerationId();
+
+        // 这两个入口只是"操作统计"：反复查看与重置，它们自身不应产生任何业务计数
+        for (int i = 0; i < 3; i++) {
+            mockMvc.perform(get("/internal/metrics")).andExpect(status().isOk());
+            mockMvc.perform(post("/internal/metrics/reset")).andExpect(status().isOk());
+        }
+
+        // 查看当前批次：所有计数必须为 0，且不存在任何 /internal/** 路由维度
+        MvcResult result = mockMvc.perform(get("/internal/metrics"))
+                .andExpect(status().isOk()).andReturn();
+        JsonNode view = JSON.readTree(result.getResponse().getContentAsString());
+
+        long totalCount = 0L;
+        for (JsonNode routeNode : view.get("routes")) {
+            String route = routeNode.get("route").asText();
+            assertTrue(!route.startsWith("/internal"),
+                    "observability endpoints must never create a metric dimension: " + route);
+            totalCount += routeNode.get("count").asLong();
+        }
+        assertEquals(0L, totalCount,
+                "viewing/resetting statistics must not add any record to the batch being inspected");
+        assertTrue(view.get("generation").asLong() > genAfterBaseline,
+                "each reset must still advance the generation even though it is not counted");
+
+        // 真正的业务请求照常进入当前批次，与"操作统计"严格区分
+        mockMvc.perform(get("/api/items/9").header(CorrelationIdFilter.HEADER_NAME, "ops-excluded"))
+                .andExpect(status().isOk());
+        MvcResult businessView = mockMvc.perform(get("/internal/metrics"))
+                .andExpect(status().isOk()).andReturn();
+        JsonNode afterBusiness = JSON.readTree(businessView.getResponse().getContentAsString());
+        assertEquals(1L, routeCountInView(afterBusiness, "/api/items/{itemId}"),
+                "only genuine business requests must accumulate; operations themselves stay excluded");
+
+        log.info("internal-ops exclusion: resets/metrics calls=7, totalCounted=0, "
+                        + "businessCount=1, currentGeneration={}",
+                afterBusiness.get("generation").asLong());
+    }
 }

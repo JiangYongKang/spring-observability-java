@@ -3,6 +3,7 @@ package com.github.highcumontoa.springobservabilityjava.observability.error;
 import com.github.highcumontoa.springobservabilityjava.observability.correlation.CorrelationContext;
 import com.github.highcumontoa.springobservabilityjava.observability.metrics.ErrorClass;
 import com.github.highcumontoa.springobservabilityjava.observability.metrics.MetricsRegistry;
+import com.github.highcumontoa.springobservabilityjava.observability.metrics.RequestMetrics;
 import com.github.highcumontoa.springobservabilityjava.observability.metrics.RequestTiming;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
@@ -26,25 +27,26 @@ public class GlobalExceptionHandler {
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
     private final ExceptionClassifier classifier;
-    private final MetricsRegistry metricsRegistry;
 
-    public GlobalExceptionHandler(ExceptionClassifier classifier, MetricsRegistry metricsRegistry) {
+    public GlobalExceptionHandler(ExceptionClassifier classifier) {
         this.classifier = classifier;
-        this.metricsRegistry = metricsRegistry;
     }
 
     /**
      * 未匹配处理器的请求不会进入 HandlerInterceptor 链，因此在此显式计入固定 UNMAPPED 桶，
      * 保证"无法归属路由的请求"既不被遗漏，也不会按原始 URI 新建维度。
-     * 耗时取自过滤器层盖的计时戳（{@link RequestTiming}），是真实处理耗时而非恒为 0。
+     * 批次与耗时都取自过滤器层进入时盖的票据/计时戳（{@link RequestMetrics}/{@link RequestTiming}），
+     * 因而这类请求同样按真实耗时记回"进入时的那一代"。
      */
     @ExceptionHandler({NoHandlerFoundException.class, NoResourceFoundException.class})
     public ResponseEntity<ApiError> handleNoHandler(HttpServletRequest request, Exception ex) {
         ExceptionClassifier.Classification result = classifier.classify(ex);
         long durationNanos = RequestTiming.elapsedNanos(request);
-        metricsRegistry.record(MetricsRegistry.UNMAPPED_TEMPLATE, durationNanos, result.errorClass());
-        log.warn("request failed: route={}, errorCategory={}, httpStatus={}, durationNanos={}",
-                MetricsRegistry.UNMAPPED_TEMPLATE, result.category(), result.httpStatus(), durationNanos);
+        long generationId = RequestMetrics.finish(
+                request, MetricsRegistry.UNMAPPED_TEMPLATE, result.errorClass());
+        log.warn("request failed: generation={}, route={}, errorCategory={}, httpStatus={}, durationNanos={}",
+                generationId, MetricsRegistry.UNMAPPED_TEMPLATE, result.category(),
+                result.httpStatus(), durationNanos);
         return ResponseEntity.status(result.httpStatus())
                 .body(new ApiError(CorrelationContext.currentId(), result.category().name(),
                         result.publicReason()));
@@ -55,10 +57,9 @@ public class GlobalExceptionHandler {
         ExceptionClassifier.Classification result = classifier.classify(ex);
 
         // 没有匹配到路由模板的请求，拦截器不会执行；此处兜底记入 UNMAPPED，防止任何路径漏记。
-        // 已匹配路由的请求由拦截器在 afterCompletion 统一记录，此处不重复计数。
+        // 已匹配路由的请求由拦截器在 afterCompletion 统一记录，finish 幂等故此处不会重复计数。
         if (request.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE) == null) {
-            metricsRegistry.record(MetricsRegistry.UNMAPPED_TEMPLATE,
-                    RequestTiming.elapsedNanos(request), result.errorClass());
+            RequestMetrics.finish(request, MetricsRegistry.UNMAPPED_TEMPLATE, result.errorClass());
         }
 
         // 日志携带关联标识（MDC）与细分类别；服务端错误保留完整堆栈用于排障

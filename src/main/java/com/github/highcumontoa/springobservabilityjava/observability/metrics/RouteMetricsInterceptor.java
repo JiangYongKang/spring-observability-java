@@ -17,8 +17,10 @@ import org.springframework.web.servlet.HandlerMapping;
  * <p>错误分类以最终对外 HTTP 状态码为准（{@link ErrorClass#fromStatus(int)}），因此无论异常
  * 是否被包装、是否被全局处理器处理，指标中的错误分类与调用方看到的状态始终一致。</p>
  *
- * <p>计时起点来自 {@link RequestTiming}（过滤器层盖戳，对所有请求生效），与兜底分组读取
- * 同一处起点，保证耗时口径统一。</p>
+ * <p>批次归属与计时起点都在请求进入时（{@link RequestMetricsFilter}）确定：此处结束时只负责
+ * 把结果记回<strong>进入时的那一代</strong>。因此重置前进入、重置后才结束的请求仍计入旧批次，
+ * 不会漏入新批次。{@link RequestMetrics#finish} 幂等：匹配到路由的请求即便同时经过全局异常
+ * 处理器，也只记录一次。</p>
  */
 public class RouteMetricsInterceptor implements HandlerInterceptor {
 
@@ -32,22 +34,27 @@ public class RouteMetricsInterceptor implements HandlerInterceptor {
 
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
-        // 拦截器只覆盖匹配到处理器的请求；此处补戳仅为防御，统一起点已由 RequestTimingFilter 盖好
-        RequestTiming.stamp(request);
+        // 批次与计时戳已由最先执行的 RequestMetricsFilter 在进入时盖好；此处兜底，保证即使过滤器装配缺失也不漏
+        RequestMetrics.begin(request, registry);
         return true;
     }
 
     @Override
     public void afterCompletion(HttpServletRequest request, HttpServletResponse response,
                                 Object handler, Exception ex) {
-        long durationNanos = RequestTiming.elapsedNanos(request);
-
         String template = resolveRouteTemplate(request);
         ErrorClass errorClass = ErrorClass.fromStatus(response.getStatus());
-        registry.record(template, durationNanos, errorClass);
 
-        // 单行结构化访问日志：关联标识来自 MDC，路由模板与错误分类与指标维度完全一致
-        log.info("request observed: route={}, method={}, status={}, errorClass={}, durationNanos={}",
+        // 记回进入时的批次（内部观测端点返回 -1，不计数）；耗时口径与兜底分组同取自 RequestTiming
+        long generationId = RequestMetrics.finish(request, template, errorClass);
+        if (generationId < 0) {
+            return;
+        }
+        long durationNanos = RequestTiming.elapsedNanos(request);
+
+        // 单行结构化访问日志：关联标识来自 MDC，批次号、路由模板与错误分类与指标维度完全一致
+        log.info("request observed: generation={}, route={}, method={}, status={}, errorClass={}, durationNanos={}",
+                generationId,
                 template == null ? MetricsRegistry.UNMAPPED_TEMPLATE : template,
                 request.getMethod(), response.getStatus(), errorClass, durationNanos);
     }

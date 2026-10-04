@@ -63,12 +63,12 @@
   路由数本身仍有上界。不使用随观测值增长的分位数结构或样本蓄水池。
 - **同一路由不被参数拆开**：档位计数挂在路由模板的 `RouteMetrics` 上，
   `/items/1` 与 `/items/2` 的分布合并在 `/api/items/{itemId}` 同一组档位里。
-- **兜底请求也有真实耗时**：计时起点由最先执行的 `RequestTimingFilter`（过滤器层，先于路由匹配）
-  盖在请求属性上，拦截器与全局异常处理器读同一处起点。因此未匹配路由、进入 `UNMAPPED`
+- **兜底请求也有真实耗时**：计时起点由最先执行的 `RequestMetricsFilter`（过滤器层，先于路由匹配）
+  在进入时盖在请求属性上，拦截器与全局异常处理器读同一处起点。因此未匹配路由、进入 `UNMAPPED`
   固定桶的请求同样统计真实耗时与档位，**不再出现耗时恒为 0 的情况**。
 - 代码入口：
   - `observability/metrics/DurationBucket.java`
-  - `observability/metrics/RequestTiming.java` / `RequestTimingFilter.java`
+  - `observability/metrics/RequestTiming.java` / `RequestMetricsFilter.java`
   - `observability/metrics/MetricsRegistry.java`
   - `observability/metrics/RouteMetrics.java`
   - `observability/metrics/RouteMetricsInterceptor.java`
@@ -77,19 +77,45 @@
 
 - 端点：`POST /internal/metrics/reset`。把统计起点**原子地**重置到当前时刻：
   返回被冻结的上一批次快照（`generation / startedAt / resetAt / 各路由最终值`），
-  随后的请求在序号 +1 的全新批次里从零累计；`GET /internal/metrics` 的 `generation`
+  随后进入的请求在序号 +1 的全新批次里从零累计；`GET /internal/metrics` 的 `generation`
   可用来确认"这一批"。
-- **语义**：以"记录完成时刻"为边界——重置前完成的请求全部留在旧批次（出现在冻结快照里），
-  重置期间或之后完成的请求全部进入新批次。历史批次冻结后不再变化，新旧批次互不污染。
-- **并发边界（不丢、不重、不混批）**：注册表内部以"代（generation）"保存计数器，
+
+- **归属边界 = 请求"进入"时刻，而不是"完成"时刻**。每个请求在刚进入（最先执行的
+  `RequestMetricsFilter`，先于路由匹配）时就领取"当前代"票据；请求结束时无论已经过去了多久、
+  中间发生过多少次重置，都记回**它进入时的那一代**。因此重置后新一批到底包含哪些请求、
+  重置时还没结束的请求归到哪一批，都有确定答案：
+
+  | 请求情形 | 归属批次 |
+  |---|---|
+  | 重置之前**已进入**，重置之后才结束的在途请求 | **旧批次**（出现在重置返回的冻结快照里） |
+  | 重置之前已进入且已结束的请求 | 旧批次 |
+  | 重置之后才进入的请求 | 新批次（从零累计） |
+  | 查看统计 `GET /internal/metrics`、重置 `POST /internal/metrics/reset` 本身 | **都不计入任何批次** |
+
+- **重置会先排空在途请求再冻结**：重置拿到独占锁后，会等待旧批次里所有"已进入未结束"的请求
+  结束（它们的结束动作不获取重置锁，所以不会死锁），最后一笔在途请求的计数落定后才生成冻结快照。
+  于是重置返回时：被冻结的旧批次**包含且仅包含**所有"重置之前已经进入"的请求；
+  之后没有任何请求能再写进旧批次（进入时只能领到新代）。重置在有在途请求时会同步阻塞到它们结束
+  （设了 30s 上限，仅用于避免疑似挂死的请求造成永久等待，正常请求远早于此完成）。
+
+- **操作统计自身不计数**：查看 / 重置入口（`/internal/**`）在过滤器层就被显式排除，
+  不领取批次、不产生任何维度。因此"先重置、紧接着查看"时，新一批确实是从零开始的，
+  不会混入"重置 + 查看"这两条操作记录——它们不是要核对的业务请求。
+
+- **并发边界（不漏、不重、不串批）**：注册表内部以"代（generation）"保存计数器，
   重置 = 整体替换当前代；并用一把 `ReentrantReadWriteLock` 协调——
-  每次 `record` 持共享读锁（记录之间仍完全并发），`reset` 持独占写锁。
-  这保证一次记录**整体**地发生在重置之前或之后，不存在"重置前读到旧计数器、重置后才写入"
-  的跨边界半截记录，因此：不丢计数、不重复计数、重置前后的请求不会混入同一批。
+  进入领取批次持共享读锁（请求之间仍完全并发），`reset` 持独占写锁。
+  每个请求只在它进入时领到的唯一一个代上记录一次，因此即使一边持续压请求、一边反复重置：
+  **每笔请求恰好属于一个批次**，不会漏算、不会重复算，也不会同一笔同时落到两批或哪批都不落；
+  连续重置任意多次，冻结快照的 `generation` 始终连续（0..N）、不重复。
 - 代码入口：
-  - `observability/metrics/Generation.java`
+  - `observability/metrics/RequestMetrics.java`（进入领批 / 结束记回 / 内部端点排除）
+  - `observability/metrics/RequestBatch.java`（请求与"进入时代"绑定的票据）
+  - `observability/metrics/RequestMetricsFilter.java`（最先执行，进入即盖戳领批）
+  - `observability/metrics/ObservabilityPaths.java`（内部观测端点判定）
+  - `observability/metrics/Generation.java`（在途计数 + 重置前排空）
   - `observability/metrics/RegistrySnapshot.java` / `RouteSnapshot.java`
-  - `observability/metrics/MetricsRegistry.java`（`reset()`）
+  - `observability/metrics/MetricsRegistry.java`（`openBatch()` / `reset()`）
   - `observability/web/MetricsController.java`
 
 - **取舍说明**：指标只在内存中保存、进程重启归零，目的是本地可复现验证；
@@ -148,8 +174,10 @@
 ```
 
 - 请求开始/结束、控制器、`@Async` 工作线程日志均带同一 `corrId`；
-- 指标拦截器每个请求打印一行 `request observed: route=<模板>, status=, errorClass=, durationNanos=`，
-  即"关联标识 + 路由模板 + 错误分类"同时出现在日志行中；
+- 指标拦截器每个业务请求打印一行
+  `request observed: generation=<批次号>, route=<模板>, status=, errorClass=, durationNanos=`，
+  即"关联标识 + 归属批次 + 路由模板 + 错误分类"同时出现，可据此核对某请求被算进了哪一批；
+  内部观测端点（`/internal/**`）不打印此行、不计数；
 - 异步任务失败时，`obs-async-*` 工作线程会打 `async job failed` ERROR 行，携带同一 `corrId`。
 
 ## 5. 演示端点
@@ -163,8 +191,9 @@
 | `POST /api/items/{itemId}/checkout` | 触发 `@Async`，验证异步标识透传 |
 | `POST /api/items/{itemId}/checkout?asyncFail=client` | 异步任务深层包装 404（验证异步失败归因、失败不计成功） |
 | `POST /api/items/{itemId}/checkout?asyncFail=server` | 异步任务内部失败 500（验证脱敏 + 工作线程 ERROR 日志） |
-| `GET /internal/metrics` | 当前批次指标快照（含 `generation` 与 `durationHistogram`） |
-| `POST /internal/metrics/reset` | 原子重置统计起点，返回冻结的上一批次 |
+| `GET /api/slow` | 可控慢端点（用于本地核对在途请求跨重置的归属，需配合测试中的 gate 使用） |
+| `GET /internal/metrics` | 当前批次指标快照（含 `generation` 与 `durationHistogram`）；**该操作自身不计数** |
+| `POST /internal/metrics/reset` | 原子重置统计起点，返回冻结的上一批次；**该操作自身不计数**，并会先排空旧批次的在途请求 |
 | 任意未注册路径 | 404 且计入 `UNMAPPED` 桶（含真实耗时） |
 
 ## 6. 本地验证方法
@@ -177,7 +206,7 @@
 mvn test
 ```
 
-测试覆盖（共 28 个用例）：
+测试覆盖（共 33 个用例）：
 
 | 测试类 | 覆盖点 |
 |---|---|
@@ -190,9 +219,15 @@ mvn test
 | `AsyncFailureLoggingTest` | 异步失败在 `obs-async-*` 工作线程打 ERROR 且携带同一关联标识 |
 | `ErrorMappingIntegrationTest` | 嵌套异常响应/指标一致、唯一令牌证明脱敏生效、未知路径只进 UNMAPPED 且有真实耗时 |
 | `MetricsResetTest` | 重置后批次独立从零累计、历史冻结不变；12 记录线程 × 3 重置线程高并发下不丢不重不混批、批次号连续 |
-| `MetricsResetEndpointTest` | 重置端点冻结上一批、当前批次归零、重置后请求只进新批 |
+| `BatchBoundaryResetTest` | 批次归属边界：重置前进入、重置后才结束的在途请求计入被冻结旧批次（重置会阻塞排空）；重置后进入的请求（含 UNMAPPED）只进新批、旧批不被改写 |
+| `BatchLifecycleConcurrencyTest` | 12 客户端"进入→随机在途→结束"× 3 个持续重置线程交错：业务与 UNMAPPED 每笔请求恰好属于一批，总账（计数/分类/耗时档）精确相等、批次号 0..N 连续 |
+| `MetricsResetEndpointTest` | 重置端点冻结上一批、当前批次归零、重置后请求只进新批；反复查看/重置操作自身零计数、不产生 `/internal/**` 维度 |
+| `InFlightRequestResetBoundaryIntegrationTest` | 真实 HTTP：业务请求跨重置在途，重置阻塞等其结束并计入旧批；新批不含它，重置后新进入的请求才进新批 |
 
-测试日志中可见 `corrId`、路由模板与 `errorClass`/`errorCategory`。
+单测日志里每个用例都有一行结论（例如 `in-flight boundary:`、`interleaved lifecycle:`、
+`internal-ops exclusion:`、`http in-flight boundary:`），可据此看到覆盖了哪些业务路由、每条用例的
+输入与归属结果；业务请求的 `request observed: generation=...` 行也能逐条核对请求被算进了哪一批。
+测试日志中同时可见 `corrId`、路由模板与 `errorClass`/`errorCategory`。
 
 ### 6.2 手工冒烟
 
@@ -221,11 +256,45 @@ curl -i http://localhost:18080/api/oops
 curl -i http://localhost:18080/some/random/path
 # 指标快照（generation + 每路由 durationHistogram；不同参数聚合在同一模板）
 curl http://localhost:18080/internal/metrics
-# 压测前重置：返回冻结的上一批，随后的请求进入 generation+1 的新批次
+# 压测前重置：返回冻结的上一批，随后进入的请求进入 generation+1 的新批次
+# （重置/查看这两个操作自身不会被计数，所以重置后这一批确实从零开始）
 curl -s -X POST http://localhost:18080/internal/metrics/reset
-# 再来一批请求后重新查看，确认只有重置后的计数
+# 重置后立刻查看：routes 里不会出现 /internal/** 维度，业务计数全为 0
+curl -s http://localhost:18080/internal/metrics
+# 再来一批业务请求后重新查看，确认只有重置之后进入的计数
 curl -H 'X-Correlation-ID: bench-1' http://localhost:18080/api/items/1
-curl http://localhost:18080/internal/metrics
+curl -s http://localhost:18080/internal/metrics
 ```
 
 同时在应用控制台可按 `corrId` 串联 Tomcat 线程与 `obs-async-*` 工作线程的全部日志行。
+
+### 6.3 本地复现/核对统计重置的三条行为
+
+1. **重置 / 查看操作本身不进批次**：
+   ```bash
+   curl -s -X POST http://localhost:18080/internal/metrics/reset   # 干净基线
+   curl -s http://localhost:18080/internal/metrics > /dev/null      # 查看若干次
+   curl -s -X POST http://localhost:18080/internal/metrics/reset > /dev/null
+   curl -s http://localhost:18080/internal/metrics                  # 所有 route 的 count 都为 0，
+   # 且 routes 中没有任何 /internal/** 维度
+   ```
+2. **重置时还没结束的请求归入旧批次**：在两个终端里操作。
+   先发起一个会挂住的请求（可用 `GET /api/slow`，它在自动化测试里由 gate 控制；
+   手工复现可用任意慢接口或把处理 `Thread.sleep` 拉长），在它**尚未返回**时于另一终端执行
+   `curl -s -X POST http://localhost:18080/internal/metrics/reset`——观察到重置会一直阻塞，
+   直到该慢请求结束；重置响应的冻结快照里已包含这条慢请求，而重置返回后
+   `GET /internal/metrics` 的新批次里它的计数为 0。
+3. **一边压请求一边反复重置，不漏不重**：
+   ```bash
+   for i in $(seq 1 200); do curl -s http://localhost:18080/api/items/$i >/dev/null & done
+   while kill -0 %1 2>/dev/null; do curl -s -X POST http://localhost:18080/internal/metrics/reset >/dev/null; done
+   # 最后再重置一次收尾：把历次冻结快照各路由 count 求和 + 当前快照 count，
+   # 总和恰好等于实际发出的请求数；每次返回的 generation 连续不重复。
+   ```
+   自动化、确定性的等价核对直接运行：
+   ```bash
+   mvn -Dtest=BatchBoundaryResetTest,BatchLifecycleConcurrencyTest,MetricsResetEndpointTest,InFlightRequestResetBoundaryIntegrationTest test
+   ```
+   日志中的 `in-flight boundary` / `post-reset accumulation` / `interleaved lifecycle` /
+   `internal-ops exclusion` / `http in-flight boundary` 行分别给出每条用例的输入批次、
+   冻结计数与新批计数，可直接对照预期。
