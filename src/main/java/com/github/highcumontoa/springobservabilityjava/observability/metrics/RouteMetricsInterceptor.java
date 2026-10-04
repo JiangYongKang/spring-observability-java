@@ -19,6 +19,13 @@ import org.springframework.web.servlet.HandlerMapping;
  *
  * <p>计时起点来自 {@link RequestTiming}（过滤器层盖戳，对所有请求生效），与兜底分组读取
  * 同一处起点，保证耗时口径统一。</p>
+ *
+ * <p>批次归属按<strong>进入时刻</strong>判定：过滤器层已在请求进入时把所属批次钉在请求属性上
+ * （{@link RequestBatch}），此处完成记录时计入该批次。因此统计重置之前已进入的请求，
+ * 即使在重置之后才完成，也只留在被冻结的旧批次里，不会混入重置后的新批次。</p>
+ *
+ * <p>操作统计自身的入口（{@code /internal/**}）在配置层被排除在本拦截器之外，
+ * 查看/重置统计的请求不会计入任何批次。</p>
  */
 public class RouteMetricsInterceptor implements HandlerInterceptor {
 
@@ -32,8 +39,9 @@ public class RouteMetricsInterceptor implements HandlerInterceptor {
 
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
-        // 拦截器只覆盖匹配到处理器的请求；此处补戳仅为防御，统一起点已由 RequestTimingFilter 盖好
+        // 拦截器只覆盖匹配到处理器的请求；此处补戳仅为防御，统一起点与批次已由 RequestTimingFilter 钉好
         RequestTiming.stamp(request);
+        RequestBatch.attach(request, registry);
         return true;
     }
 
@@ -44,7 +52,8 @@ public class RouteMetricsInterceptor implements HandlerInterceptor {
 
         String template = resolveRouteTemplate(request);
         ErrorClass errorClass = ErrorClass.fromStatus(response.getStatus());
-        registry.record(template, durationNanos, errorClass);
+        // 计入"进入时"钉下的批次：重置前进入的请求即使现在才完成，也只留在旧批次
+        registry.record(RequestBatch.current(request, registry), template, durationNanos, errorClass);
 
         // 单行结构化访问日志：关联标识来自 MDC，路由模板与错误分类与指标维度完全一致
         log.info("request observed: route={}, method={}, status={}, errorClass={}, durationNanos={}",

@@ -46,9 +46,22 @@ public class DemoController {
         return Map.of("itemId", itemId, "correlationId", CorrelationContext.currentId());
     }
 
+    /**
+     * 慢请求演示端点：固定睡眠 {@code millis} 毫秒（上限 30 秒，防止误挂）。
+     * 用于手工复现"统计重置时仍有在途请求"的场景：重置前进入的慢请求，
+     * 即使在重置之后才结束，也只计入重置前的旧批次，不会混入新批次。
+     */
+    @GetMapping("/slow")
+    public Map<String, Object> slow(@RequestParam(name = "millis", defaultValue = "1000") long millis)
+            throws InterruptedException {
+        long clamped = Math.max(0L, Math.min(millis, 30_000L));
+        log.info("slow request started: millis={}", clamped);
+        Thread.sleep(clamped);
+        return Map.of("sleptMillis", clamped, "correlationId", CorrelationContext.currentId());
+    }
+
     @GetMapping("/oops")
-    public Map<String, Object> oops(@RequestParam(name = "kind", defaultValue = "server") String kind) {
-        if ("client".equals(kind)) {
+    public Map<String, Object> oops(@RequestParam(name = "kind", defaultValue = "server") String kind) {        if ("client".equals(kind)) {
             // 深层包装的客户端错误：cause 链第 3 层才是可识别异常。
             // 消息中携带唯一敏感令牌，仅应出现在服务端日志；若响应回显异常 message 就会泄漏它
             throw new RuntimeException("outer wrapper",

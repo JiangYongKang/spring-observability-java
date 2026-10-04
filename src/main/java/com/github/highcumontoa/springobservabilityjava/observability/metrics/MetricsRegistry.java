@@ -1,6 +1,5 @@
 package com.github.highcumontoa.springobservabilityjava.observability.metrics;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -17,14 +16,20 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * 每个 generation 是一套独立计数器。{@link #reset()} 原子地把"当前代"切换为一套全新的
  * 空计数器，并冻结、返回上一代的快照。</p>
  *
- * <p><strong>并发边界</strong>：记录走共享读锁（彼此完全并发），重置走独占写锁。
- * 这保证一次记录<strong>整体</strong>地发生在重置之前或之后——不允许"重置前读旧代、
- * 重置后写旧代"这种跨越边界的半截记录：</p>
+ * <p><strong>批次归属按"进入时刻"判定</strong>：请求进入时调用 {@link #currentBatch()}
+ * 固定归属的代，完成时通过 {@link #record(Generation, String, long, ErrorClass)} 计入该代。
+ * 因此重置之前已进入的请求，无论在重置后多久才结束，都只计入旧（已冻结）批次；
+ * 新批次只累计重置之后才进入的请求，边界干净、不混批。</p>
+ *
+ * <p><strong>并发边界</strong>：归属判定（{@link #currentBatch()}）与即时记录
+ * （{@link #record(String, long, ErrorClass)}）走共享读锁（彼此完全并发），重置走独占写锁。
+ * 这保证归属判定<strong>整体</strong>地发生在重置之前或之后——不允许"重置前读旧代、
+ * 重置后写旧代"这种跨越边界的半截判定：</p>
  * <ul>
- *   <li>在重置获取写锁前完成的记录 → 全部留在旧批次，并出现在冻结快照里；</li>
- *   <li>重置期间或之后完成的记录 → 阻塞到切换完成，落入新批次，从零开始累计；</li>
- *   <li>每次记录只递增一次，因此不重复计数、不丢失计数，
- *       重置前后的请求不可能出现在同一批数据里；重置本身可被并发安全地反复调用。</li>
+ *   <li>在重置获取写锁前完成归属判定的请求 → 计入旧批次，被冻结快照吸收；</li>
+ *   <li>重置期间或之后判定归属的请求 → 阻塞到切换完成，落入新批次，从零开始累计；</li>
+ *   <li>每次记录只在进入时判定的那一个代上递增一次，因此不重复计数、不丢失计数，
+ *       每笔请求恰好属于一个批次；重置本身可被并发安全地反复调用。</li>
  * </ul>
  */
 public final class MetricsRegistry {
@@ -40,9 +45,13 @@ public final class MetricsRegistry {
     }
 
     /**
-     * 按路由模板记录一次请求。整个记录在共享读锁下完成，与重置的写锁互斥：
+     * 按路由模板记录一次请求（即时归属：计入调用这一刻的当前批次）。
+     * 整个归属判定与记录在共享读锁下完成，与重置的写锁互斥：
      * 因此本次记录要么完整计入重置前批次，要么完整计入重置后批次，恰好属于一个批次。
      * {@code null} 或 {@link #UNMAPPED_TEMPLATE} 进入固定桶。
+     *
+     * <p>Web 请求应改用"进入时定归属"的组合：进入时 {@link #currentBatch()}，
+     * 完成时 {@link #record(Generation, String, long, ErrorClass)}。</p>
      */
     public void record(String routeTemplate, long durationNanos, ErrorClass errorClass) {
         resetLock.readLock().lock();
@@ -51,6 +60,31 @@ public final class MetricsRegistry {
         } finally {
             resetLock.readLock().unlock();
         }
+    }
+
+    /**
+     * 返回"此刻进入的请求"应当归属的批次句柄。归属判定在共享读锁下完成，
+     * 与重置的写锁互斥：返回的要么是重置前的旧代，要么是切换完成后的新代，绝不跨边界。
+     */
+    public Generation currentBatch() {
+        resetLock.readLock().lock();
+        try {
+            return current.get();
+        } finally {
+            resetLock.readLock().unlock();
+        }
+    }
+
+    /**
+     * 把一次完成的请求计入它在进入时固定下来的批次 {@code batch}。
+     * 即使该批次已被重置冻结（请求在重置前进入、重置后才结束），也只计入这个旧批次，
+     * 不会落入当前新批次。批次对象本身的计数器线程安全，此处无需再加锁。
+     */
+    public void record(Generation batch, String routeTemplate, long durationNanos, ErrorClass errorClass) {
+        if (batch == null) {
+            throw new IllegalArgumentException("batch must not be null");
+        }
+        batch.metricsFor(routeTemplate).record(durationNanos, errorClass);
     }
 
     /** 返回当前批次内指定路由模板（含固定 UNMAPPED 桶）的指标；不存在则原子创建。 */
@@ -86,8 +120,10 @@ public final class MetricsRegistry {
     /**
      * 原子重置统计起点：切换到全新的空批次（序号 +1），并返回被冻结的上一批次快照。
      *
-     * <p>持有独占写锁期间没有任何记录在进行，因此：返回时旧批次的所有计数就是
-     * 最终值（快照逐一拷贝原始数值），而之后完成的记录必然落入新批次。</p>
+     * <p>持有独占写锁期间没有任何归属判定在进行，因此切换瞬间不存在"半新半旧"的请求：
+     * 之前进入的请求全部归属旧批次，之后进入的全部归属新批次。旧批次对"新进入"关闭，
+     * 但重置前已进入、重置后才结束的在途请求完成时仍计入旧批次——
+     * 冻结快照是对旧批次计数器的实时视图，会随之反映这些迟到的完成。</p>
      */
     public RegistrySnapshot reset() {
         resetLock.writeLock().lock();
@@ -95,14 +131,9 @@ public final class MetricsRegistry {
             Generation previous = current.get();
             long resetAt = System.currentTimeMillis();
 
-            List<RouteSnapshot> routes = new ArrayList<>();
-            for (RouteMetrics metrics : previous.routes()) {
-                routes.add(RouteSnapshot.from(previous.id(), metrics));
-            }
-            RegistrySnapshot frozen = new RegistrySnapshot(
-                    previous.id(), previous.startedAtEpochMillis(), resetAt, routes);
-
-            // 切换在快照之后：此刻不存在任何针对旧代的进行中记录（写锁独占）
+            // 冻结视图包装旧批次（实时读取，迟到的在途完成会反映到后续访问）；
+            // 切换在包装之后：此刻不存在任何针对旧代的进行中归属判定（写锁独占）
+            RegistrySnapshot frozen = RegistrySnapshot.from(previous, resetAt);
             current.set(new Generation(previous.id() + 1, resetAt));
             return frozen;
         } finally {

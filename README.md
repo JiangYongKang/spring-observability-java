@@ -76,20 +76,37 @@
 ### 2.2 统计重置（批次隔离，压测/回归用）
 
 - 端点：`POST /internal/metrics/reset`。把统计起点**原子地**重置到当前时刻：
-  返回被冻结的上一批次快照（`generation / startedAt / resetAt / 各路由最终值`），
+  返回被冻结的上一批次视图（`generation / startedAt / resetAt / 各路由数据`），
   随后的请求在序号 +1 的全新批次里从零累计；`GET /internal/metrics` 的 `generation`
   可用来确认"这一批"。
-- **语义**：以"记录完成时刻"为边界——重置前完成的请求全部留在旧批次（出现在冻结快照里），
-  重置期间或之后完成的请求全部进入新批次。历史批次冻结后不再变化，新旧批次互不污染。
+- **操作入口不自统计**：`/internal/**`（查看/重置统计）在拦截器配置层被排除，
+  这两个操作本身不会计入任何批次——重置后立刻查看，新批次一定是干净的零，
+  不会混进"重置"和"查看"这两个请求自身的记录。
+- **批次归属按"进入时刻"判定**：请求进入时（最先执行的 `RequestTimingFilter`）
+  就把所属批次钉在请求属性上，完成时计入该批次。因此：
+  - 重置**之后**才进入的请求 → 只累计在新批次；
+  - 重置**之前**已进入、但重置后才结束的在途请求 → **只留在被冻结的旧批次里**，
+    无论它多久之后才结束，都不会混入新批次；
+  - 重置返回之后，新一批只反映重置之后真正进入的业务请求。
+- **冻结批次是实时视图**：旧批次对"新进入的请求"关闭，但会继续吸收重置前已进入、
+  重置后才完成的在途请求（包括因迟到完成才首次建桶的路由）。因此任何一笔请求都
+  恰好属于一个批次，不会出现"哪一批都没算上"的漏算。注意：重置接口的**响应体**
+  在返回那一刻序列化，是重置时刻的切面；之后才结束的在途请求不可能出现在已发出的
+  响应体里，但会留存在旧批次数据中（冻结视图后续读取可见）。
 - **并发边界（不丢、不重、不混批）**：注册表内部以"代（generation）"保存计数器，
   重置 = 整体替换当前代；并用一把 `ReentrantReadWriteLock` 协调——
-  每次 `record` 持共享读锁（记录之间仍完全并发），`reset` 持独占写锁。
-  这保证一次记录**整体**地发生在重置之前或之后，不存在"重置前读到旧计数器、重置后才写入"
-  的跨边界半截记录，因此：不丢计数、不重复计数、重置前后的请求不会混入同一批。
+  归属判定（`currentBatch()`）与即时记录持共享读锁（请求之间仍完全并发），
+  `reset` 持独占写锁。这保证归属判定**整体**地发生在重置之前或之后，
+  不存在"重置前读到旧代、重置后才归属"的跨边界半截判定，因此：
+  不丢计数、不重复计数、同一笔请求不会同时落到两批里；
+  连续重置任意多次，批次号严格连续（0..N），结果可预期。
 - 代码入口：
   - `observability/metrics/Generation.java`
-  - `observability/metrics/RegistrySnapshot.java` / `RouteSnapshot.java`
-  - `observability/metrics/MetricsRegistry.java`（`reset()`）
+  - `observability/metrics/RegistrySnapshot.java` / `RouteSnapshot.java`（冻结批次的实时视图）
+  - `observability/metrics/MetricsRegistry.java`（`currentBatch()` / `reset()`）
+  - `observability/metrics/RequestBatch.java`（进入时钉批次）
+  - `observability/metrics/RequestTimingFilter.java` / `RouteMetricsInterceptor.java`
+  - `observability/config/WebObservabilityConfig.java`（`/internal/**` 排除）
   - `observability/web/MetricsController.java`
 
 - **取舍说明**：指标只在内存中保存、进程重启归零，目的是本地可复现验证；
@@ -157,6 +174,7 @@
 | 方法/路径 | 说明 |
 |---|---|
 | `GET /api/items/{itemId}` | 正常请求；加 `?fail=1` 触发 400 |
+| `GET /api/slow?millis=N` | 慢请求（睡眠 N 毫秒，上限 30s），用于复现"重置时仍有在途请求" |
 | `GET /api/oops?kind=client` | 三层包装的 404（验证解包归因；含唯一敏感令牌验证脱敏） |
 | `GET /api/oops?kind=conflict` | 409 |
 | `GET /api/oops`（默认） | 三层包装的 500（含伪造敏感串，验证脱敏） |
@@ -177,7 +195,7 @@
 mvn test
 ```
 
-测试覆盖（共 28 个用例）：
+测试覆盖（共 32 个用例）：
 
 | 测试类 | 覆盖点 |
 |---|---|
@@ -189,8 +207,8 @@ mvn test
 | `AsyncFailureAttributionTest` | 异步 client/server 失败归因一致、失败不计成功、成功仍计成功、同关联标识、内部细节不外泄 |
 | `AsyncFailureLoggingTest` | 异步失败在 `obs-async-*` 工作线程打 ERROR 且携带同一关联标识 |
 | `ErrorMappingIntegrationTest` | 嵌套异常响应/指标一致、唯一令牌证明脱敏生效、未知路径只进 UNMAPPED 且有真实耗时 |
-| `MetricsResetTest` | 重置后批次独立从零累计、历史冻结不变；12 记录线程 × 3 重置线程高并发下不丢不重不混批、批次号连续 |
-| `MetricsResetEndpointTest` | 重置端点冻结上一批、当前批次归零、重置后请求只进新批 |
+| `MetricsResetTest` | 重置后批次独立从零累计、历史冻结不变；重置时在途请求只留旧批次、不进新批次（冻结视图吸收迟到完成）；即时记录与"进入时定归属"两种模式下，高并发交错重置均不丢不重不混批、批次号连续 |
+| `MetricsResetEndpointTest` | 重置端点冻结上一批、当前批次归零、重置后请求只进新批；查看/重置操作自身不计入任何批次；门控在途请求跨重置不污染新批次 |
 
 测试日志中可见 `corrId`、路由模板与 `errorClass`/`errorCategory`。
 
@@ -226,6 +244,27 @@ curl -s -X POST http://localhost:18080/internal/metrics/reset
 # 再来一批请求后重新查看，确认只有重置后的计数
 curl -H 'X-Correlation-ID: bench-1' http://localhost:18080/api/items/1
 curl http://localhost:18080/internal/metrics
+```
+
+### 6.3 核对重置行为（操作入口不自统计 / 在途请求归属）
+
+```bash
+# 1) 操作入口不自统计：重置后立刻查看，新批次所有路由计数都是 0，
+#    不会出现 /internal/metrics、/internal/metrics/reset 自身的记录
+curl -s -X POST http://localhost:18080/internal/metrics/reset > /dev/null
+curl -s http://localhost:18080/internal/metrics
+#   → routes 里各项 count 全为 0（且没有任何 /internal/* 路由）
+
+# 2) 在途请求只留旧批次：后台发一个 5 秒的慢请求，趁它没结束时重置
+curl -s -H 'X-Correlation-ID: slow-1' 'http://localhost:18080/api/slow?millis=5000' &
+sleep 1                                        # 确保慢请求已"进入"
+curl -s -X POST http://localhost:18080/internal/metrics/reset   # 冻结旧批次
+sleep 5                                        # 等慢请求在重置之后才结束
+curl -s http://localhost:18080/internal/metrics
+#   → 新批次里没有 /api/slow（它归属重置前的旧批次，不计入新一批）
+curl -s -H 'X-Correlation-ID: bench-2' http://localhost:18080/api/items/2
+curl -s http://localhost:18080/internal/metrics
+#   → 新批次只有重置之后才进入的 /api/items/{itemId}，count=1
 ```
 
 同时在应用控制台可按 `corrId` 串联 Tomcat 线程与 `obs-async-*` 工作线程的全部日志行。

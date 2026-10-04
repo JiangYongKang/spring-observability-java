@@ -24,8 +24,8 @@ public class WebObservabilityConfig implements WebMvcConfigurer {
     }
 
     @Bean
-    public RequestTimingFilter requestTimingFilter() {
-        return new RequestTimingFilter();
+    public RequestTimingFilter requestTimingFilter(MetricsRegistry registry) {
+        return new RequestTimingFilter(registry);
     }
 
     @Bean
@@ -57,6 +57,9 @@ public class WebObservabilityConfig implements WebMvcConfigurer {
 
     @Override
     public void addInterceptors(InterceptorRegistry registry) {
-        registry.addInterceptor(routeMetricsInterceptor(metricsRegistry()));
+        // /internal/** 是操作统计自身的入口（查看/重置），不计入任何业务批次，
+        // 否则重置后立刻查看时，新批次里会混进这两个操作本身的记录
+        registry.addInterceptor(routeMetricsInterceptor(metricsRegistry()))
+                .excludePathPatterns("/internal/**");
     }
 }

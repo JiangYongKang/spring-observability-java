@@ -8,11 +8,16 @@ import java.util.concurrent.ConcurrentMap;
 /**
  * 一个统计批次（generation）：拥有自己独立的一套路由计数器。
  *
- * <p>重置 = 在注册表层面整体替换 generation。旧 generation 不再被新写入触及，
- * 因此重置前后记录的请求天然落在两套不同计数器里，不可能混入同一批；
- * 每次 {@code record} 只在它解析到的唯一一个 generation 上递增一次，不重复、不丢失。</p>
+ * <p>重置 = 在注册表层面整体替换当前 generation。请求在<strong>进入时</strong>通过
+ * {@link MetricsRegistry#currentBatch()} 固定归属的 generation，完成时计入该 generation——
+ * 因此重置之前进入的请求，无论多久之后才结束，都只留在旧批次里，绝不会落入新批次；
+ * 旧批次对"新进入的请求"关闭，但仍吸收重置前已进入、重置后才完成的在途请求。</p>
+ *
+ * <p>对本包之外而言，本类是一个<strong>不透明句柄</strong>：只能被获取并回传给
+ * {@link MetricsRegistry#record(Generation, String, long, ErrorClass)}，
+ * 所有读写方法均为包级可见。</p>
  */
-final class Generation {
+public final class Generation {
 
     private final long id;
     private final long startedAtEpochMillis;

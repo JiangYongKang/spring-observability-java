@@ -3,6 +3,7 @@ package com.github.highcumontoa.springobservabilityjava.observability.error;
 import com.github.highcumontoa.springobservabilityjava.observability.correlation.CorrelationContext;
 import com.github.highcumontoa.springobservabilityjava.observability.metrics.ErrorClass;
 import com.github.highcumontoa.springobservabilityjava.observability.metrics.MetricsRegistry;
+import com.github.highcumontoa.springobservabilityjava.observability.metrics.RequestBatch;
 import com.github.highcumontoa.springobservabilityjava.observability.metrics.RequestTiming;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
@@ -42,7 +43,9 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiError> handleNoHandler(HttpServletRequest request, Exception ex) {
         ExceptionClassifier.Classification result = classifier.classify(ex);
         long durationNanos = RequestTiming.elapsedNanos(request);
-        metricsRegistry.record(MetricsRegistry.UNMAPPED_TEMPLATE, durationNanos, result.errorClass());
+        // 计入请求进入时钉下的批次：重置前进入的请求即使现在才失败，也只留在旧批次
+        metricsRegistry.record(RequestBatch.current(request, metricsRegistry),
+                MetricsRegistry.UNMAPPED_TEMPLATE, durationNanos, result.errorClass());
         log.warn("request failed: route={}, errorCategory={}, httpStatus={}, durationNanos={}",
                 MetricsRegistry.UNMAPPED_TEMPLATE, result.category(), result.httpStatus(), durationNanos);
         return ResponseEntity.status(result.httpStatus())
@@ -56,8 +59,10 @@ public class GlobalExceptionHandler {
 
         // 没有匹配到路由模板的请求，拦截器不会执行；此处兜底记入 UNMAPPED，防止任何路径漏记。
         // 已匹配路由的请求由拦截器在 afterCompletion 统一记录，此处不重复计数。
+        // 同样计入请求进入时钉下的批次，保证重置边界对兜底记录也干净。
         if (request.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE) == null) {
-            metricsRegistry.record(MetricsRegistry.UNMAPPED_TEMPLATE,
+            metricsRegistry.record(RequestBatch.current(request, metricsRegistry),
+                    MetricsRegistry.UNMAPPED_TEMPLATE,
                     RequestTiming.elapsedNanos(request), result.errorClass());
         }
 
